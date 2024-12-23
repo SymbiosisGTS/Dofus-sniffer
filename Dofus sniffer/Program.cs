@@ -3,20 +3,18 @@ using PacketDotNet;
 using SharpPcap;
 using Com.Ankama.Dofus.Server.Game.Protocol;
 using Com.Ankama.Dofus.Server.Connection.Protocol;
-using System.Net;
-using System.Net.Sockets;
-using System.Collections.Generic;
 using Com.Ankama.Dofus.Server.Game.Protocol.Chat;
-using Google.Protobuf.Reflection;
-using System.Xml;
-using Newtonsoft.Json;
+using System.Net.Sockets;
 
 class Program
 {
     private static Dictionary<string, List<byte>> bufferMap = new();
     private static List<string> connectionIPList = new() { "34.249.146.47", "54.74.22.247" };
 
-    static async Task Main(string[] args)
+    private static TcpClient client;
+    private static NetworkStream stream;
+
+    static void Main(string[] args)
     {
         bufferMap["ConnectionServerClientToServer"] = new List<byte>();
         bufferMap["ConnectionServerServerToClient"] = new List<byte>();
@@ -55,6 +53,27 @@ class Program
         }
     }
 
+    public static void SendToServer(int port, byte[] data)
+    {
+        foreach (var ipList in connectionIPList)
+        {
+            try
+            {
+                using (var client = new TcpClient(ipList, port))
+                using (var stream = client.GetStream())
+                {
+                    // Envoyer le message encodé
+                    stream.Write(data, 0, data.Length);
+                    Console.WriteLine("[INFO] Message sent to server.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Failed to send message: {ex.Message}");
+            }
+        }
+    }
+
     private static void HandleIPv4Packet(IPv4Packet ipPacket)
     {
         if (ipPacket.PayloadPacket is TcpPacket tcpPacket)
@@ -75,11 +94,17 @@ class Program
             return;
         }
 
-        var serverType = connectionIPList.Contains(ipPacket.SourceAddress.ToString()) ? "ConnectionServer" : "GameServer";
-        IMessage message = serverType == "ConnectionServer" ? new LoginMessage() : new GameMessage();
+        var serverType = connectionIPList.Contains(ipPacket.SourceAddress.ToString()) ? ServerType.ConnectionServer : ServerType.GameServer;
+        IMessage message = serverType == ServerType.ConnectionServer ? new LoginMessage() : new GameMessage();
 
-        var direction = tcpPacket.SourcePort == 5555 ? "ServerToClient" : "ClientToServer";
-        var bufferId = serverType + direction;
+        var direction = tcpPacket.SourcePort == 5555 ? Direction.ServerToClient : Direction.ClientToServer;
+        var bufferId = $"{serverType}{direction}";
+
+        if (!bufferMap.ContainsKey(bufferId))
+        {
+            bufferMap[bufferId] = new List<byte>();
+        }
+
 
         if (!bufferMap.ContainsKey(bufferId))
         {
@@ -101,13 +126,9 @@ class Program
             var payload = partialBuffer.GetRange(sizeLength, size).ToArray();
             partialBuffer.RemoveRange(0, sizeLength + size);
 
-            try
+            if (!Protocol.DecodeMessage(payload, message)) // Step 1 décoder le payload 
             {
-                message.MergeFrom(payload);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERREUR Protobuf] Impossible de décoder : {ex.Message}");
+                Console.WriteLine($"[ERREUR] Impossible de décoder le message Protobuf: {BitConverter.ToString(payload)}");
                 continue;
             }
 
@@ -117,14 +138,13 @@ class Program
         bufferMap[bufferId] = partialBuffer;
     }
 
-    private static void ProcessMessage(string direction, string serverType, IMessage message)
+    private static void ProcessMessage(Direction direction, ServerType serverType, IMessage message)
     {
         string msgType = "UNK";
         string msgName = "Unknown";
-        string messageDetails = "{}";
 
         // ConnectionServer
-        if (serverType == "ConnectionServer" && message is LoginMessage cm)
+        if (serverType == ServerType.ConnectionServer && message is LoginMessage cm)
         {
             switch (cm.ContentCase)
             {
@@ -145,7 +165,7 @@ class Program
             }
         }
         // GameServer
-        else if (serverType == "GameServer" && message is GameMessage gm)
+        else if (serverType == ServerType.GameServer && message is GameMessage gm)
         {
             switch (gm.ContentCase)
             {
@@ -158,7 +178,6 @@ class Program
                     msgType = "RES";
                     msgName = gm.Response.Content.TypeUrl;
                     break;
-
                 case GameMessage.ContentOneofCase.Event:
                     msgType = "EVT";
                     msgName = gm.Event.Content.TypeUrl;
@@ -166,18 +185,10 @@ class Program
             }
         }
 
-        if (direction == "ClientToServer")
-        {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[C->S] [{msgType}] {msgName}");
-            Console.WriteLine(message);
-        }
-        else if (direction == "ServerToClient")
-        {
-            Console.ForegroundColor = ConsoleColor.Blue;
-            Console.WriteLine($"[S->C] [{msgType}] {msgName}");
-            Console.WriteLine(message);
-        }
+        Protocol.PrettyPrintMessage(message); // Step 2 print le message avec le resolver
+
+        Console.ForegroundColor = direction == Direction.ClientToServer ? ConsoleColor.Cyan : ConsoleColor.Blue;
+        Console.WriteLine($"[{direction}] [{msgType}] {msgName}");
         Console.ResetColor();
     }
 
